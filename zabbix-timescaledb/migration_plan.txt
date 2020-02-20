@@ -1,0 +1,216 @@
+# ставим на мастер и реплику timescaledb 
+sudo yum install -y https://download.postgresql.org/pub/repos/yum/11/redhat/rhel-7-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+
+# прописываем репозиторий
+sudo tee /etc/yum.repos.d/timescale_timescaledb.repo <<EOL
+[timescale_timescaledb]
+name=timescale_timescaledb
+baseurl=https://packagecloud.io/timescale/timescaledb/el/7/\$basearch
+repo_gpgcheck=1
+gpgcheck=0
+enabled=1
+gpgkey=https://packagecloud.io/timescale/timescaledb/gpgkey
+sslverify=1
+sslcacert=/etc/pki/tls/certs/ca-bundle.crt
+metadata_expire=300
+EOL
+
+# ставим расширение
+sudo yum install -y timescaledb-postgresql-11
+
+psql -c "alter system set shared_preload_libraries = 'timescaledb';"
+systemctl restart postgresql-11
+
+# далее код sql в котором повторяем структуру таблиц
+# структура таблиц сгенерирована для версии заббикс 4.2.6
+
+CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
+
+
+DROP TABLE IF EXISTS hstrymp;
+DROP TABLE IF EXISTS hstrymp_uint;
+DROP TABLE IF EXISTS hstrymp_str;
+DROP TABLE IF EXISTS hstrymp_log;
+DROP TABLE IF EXISTS hstrymp_text;
+DROP TABLE IF EXISTS trndsmp;
+DROP TABLE IF EXISTS trndsmp_uint;
+
+CREATE TABLE hstrymp (
+	itemid                   bigint                                    NOT NULL,
+	clock                    integer         DEFAULT '0'               NOT NULL,
+	value                    numeric(16,4)   DEFAULT '0.0000'          NOT NULL,
+	ns                       integer         DEFAULT '0'               NOT NULL
+);
+CREATE INDEX hstrymp_1 ON hstrymp (itemid,clock);
+CREATE TABLE hstrymp_uint (
+	itemid                   bigint                                    NOT NULL,
+	clock                    integer         DEFAULT '0'               NOT NULL,
+	value                    numeric(20)     DEFAULT '0'               NOT NULL,
+	ns                       integer         DEFAULT '0'               NOT NULL
+);
+CREATE INDEX hstrymp_uint_1 ON hstrymp_uint (itemid,clock);
+CREATE TABLE hstrymp_str (
+	itemid                   bigint                                    NOT NULL,
+	clock                    integer         DEFAULT '0'               NOT NULL,
+	value                    varchar(255)    DEFAULT ''                NOT NULL,
+	ns                       integer         DEFAULT '0'               NOT NULL
+);
+CREATE INDEX hstrymp_str_1 ON hstrymp_str (itemid,clock);
+CREATE TABLE hstrymp_log (
+	itemid                   bigint                                    NOT NULL,
+	clock                    integer         DEFAULT '0'               NOT NULL,
+	timestamp                integer         DEFAULT '0'               NOT NULL,
+	source                   varchar(64)     DEFAULT ''                NOT NULL,
+	severity                 integer         DEFAULT '0'               NOT NULL,
+	value                    text            DEFAULT ''                NOT NULL,
+	logeventid               integer         DEFAULT '0'               NOT NULL,
+	ns                       integer         DEFAULT '0'               NOT NULL
+);
+CREATE INDEX hstrymp_log_1 ON hstrymp_log (itemid,clock);
+CREATE TABLE hstrymp_text (
+	itemid                   bigint                                    NOT NULL,
+	clock                    integer         DEFAULT '0'               NOT NULL,
+	value                    text            DEFAULT ''                NOT NULL,
+	ns                       integer         DEFAULT '0'               NOT NULL
+);
+CREATE INDEX hstrymp_text_1 ON hstrymp_text (itemid,clock);
+
+CREATE TABLE trndsmp (
+	itemid                   bigint                                    NOT NULL,
+	clock                    integer         DEFAULT '0'               NOT NULL,
+	num                      integer         DEFAULT '0'               NOT NULL,
+	value_min                numeric(16,4)   DEFAULT '0.0000'          NOT NULL,
+	value_avg                numeric(16,4)   DEFAULT '0.0000'          NOT NULL,
+	value_max                numeric(16,4)   DEFAULT '0.0000'          NOT NULL,
+	PRIMARY KEY (itemid,clock)
+);
+CREATE TABLE trndsmp_uint (
+	itemid                   bigint                                    NOT NULL,
+	clock                    integer         DEFAULT '0'               NOT NULL,
+	num                      integer         DEFAULT '0'               NOT NULL,
+	value_min                numeric(20)     DEFAULT '0'               NOT NULL,
+	value_avg                numeric(20)     DEFAULT '0'               NOT NULL,
+	value_max                numeric(20)     DEFAULT '0'               NOT NULL,
+	PRIMARY KEY (itemid,clock)
+);
+
+
+ALTER TABLE hstrymp OWNER TO zabbix;
+ALTER TABLE hstrymp_uint OWNER TO zabbix;
+ALTER TABLE hstrymp_str OWNER TO zabbix;
+ALTER TABLE hstrymp_log OWNER TO zabbix;
+ALTER TABLE hstrymp_text OWNER TO zabbix;
+ALTER TABLE trndsmp OWNER TO zabbix;
+ALTER TABLE trndsmp_uint OWNER TO zabbix;
+
+
+SELECT create_hypertable('hstrymp', 'clock', chunk_time_interval => 86400, migrate_data => true);
+SELECT create_hypertable('hstrymp_uint', 'clock', chunk_time_interval => 86400, migrate_data => true);
+SELECT create_hypertable('hstrymp_log', 'clock', chunk_time_interval => 86400, migrate_data => true);
+SELECT create_hypertable('hstrymp_text', 'clock', chunk_time_interval => 86400, migrate_data => true);
+SELECT create_hypertable('hstrymp_str', 'clock', chunk_time_interval => 86400, migrate_data => true);
+SELECT create_hypertable('trndsmp', 'clock', chunk_time_interval => 86400, migrate_data => true);
+SELECT create_hypertable('trndsmp_uint', 'clock', chunk_time_interval => 86400, migrate_data => true);
+
+
+-- test rename 
+-- ALTER TABLE hstrymp_log RENAME TO hstrymp2_log;
+-- ALTER TABLE hstrymp2_log RENAME TO hstrymp_log;
+
+# переливка данных
+# переливать таблицы, переименовывать и дропать можно по очереди, тем самым можно сэкономить место 
+
+time for i in $(seq 1580509401 5000 1581714000); do 
+    echo $i; 
+    time psql \
+     -d zabbix \
+     -c "\\copy (select itemid, clock, value, ns from history where clock between $i and ($i+5000)) to stdout;" | \
+    psql -U postgres \
+     -d zabbix \
+     -c "\\copy hstrymp from stdin;"
+    sleep 60
+    psql -d zabbix -c "checkpoint;"
+done
+
+time for i in $(seq 1580509401 5000 1581714000); do 
+    echo $i; 
+    time psql \
+        -d zabbix \
+        -c "\\copy (select itemid, clock, value, ns from history_uint where clock between $i and ($i+5000)) to stdout;" | \
+    psql -U postgres \
+        -d zabbix \
+        -c "\\copy hstrymp_uint from stdin;"
+    sleep 60
+    psql -d zabbix -c "checkpoint;"
+done
+
+time for i in $(seq 1580504400 5000 1581714000); do 
+    echo $i; 
+    time psql \
+        -d zabbix \
+        -c "\\copy (select itemid, clock, value, ns from history_text where clock between $i and ($i+5000)) to stdout;" | \
+    psql -U postgres \
+        -d zabbix \
+        -c "\\copy hstrymp_text from stdin;"
+done
+
+time for i in $(seq 1580504400 5000 1581714000); do 
+    echo $i; 
+    time psql \
+        -d zabbix \
+        -c "\\copy (select itemid, clock, value, ns from history_str where clock between $i and ($i+5000)) to stdout;" | \
+    psql -U postgres \
+        -d zabbix \
+        -c "\\copy hstrymp_str from stdin;"
+done
+
+time for i in $(seq 1580504400 5000 1581714000); do 
+    echo $i; 
+    time psql \
+        -d zabbix \
+        -c "\\copy (select itemid, clock, timestamp, source, severity, value, logeventid, ns from history_log where clock between $i and ($i+5000)) to stdout;" | \
+    psql -U postgres \
+        -d zabbix \
+        -c "\\copy hstrymp_log from stdin;"
+done
+
+-- test 
+time for i in $(seq 1580499400 5000 1580504400); do 
+    echo $i; 
+    time psql \
+     -d zabbix \
+     -c "\\copy (select itemid, clock, value, ns from history where clock between $i and ($i+5000)) to stdout;" | \
+    psql -U postgres \
+     -d zabbix \
+     -c "\\copy hstrymp from stdin;"
+done
+
+time for i in $(seq 1580499400 5000 1580504400); do 
+    echo $i; 
+    time psql \
+        -d zabbix \
+        -c "\\copy (select itemid, clock, value, ns from history_uint where clock between $i and ($i+5000)) to stdout;" | \
+    psql -U postgres \
+        -d zabbix \
+        -c "\\copy hstrymp_uint from stdin;"
+done
+
+# если настроено архивирование, нужно следить за местом и чистить, проверив, не нужны ли архивы реплике
+find /var/lib/pgsql/11/archive/ -mindepth 1 -type f -mtime +1 | xargs rm
+
+# как перелили данные, можно переименовать таблицы (нужно ограничить доступ к субд изменив настройки порта обращения, например, или поправив pg_hba.conf)
+
+ALTER TABLE history RENAME TO history_old;
+ALTER TABLE hstrymp RENAME TO history;
+
+# по всем остальным таблицам аналогично переименовываем
+# запускаем приложение и смотрим как работает, в случае проблем откат тривиальный - заново переименовать таблицы, при этом можно даже сохранить данные в момент работы таймскейл.
+
+# если нет проблем, то дропаем старые таблицы 
+DROP TABLE history_old;
+
+# меняем настройки в конфиге 
+UPDATE config SET db_extension='timescaledb',hk_hstrymp_global=1,hk_trndsmp_global=1;
+
+план отката
+UPDATE config SET db_extension='',hk_history_global=0,hk_trends_global=0;
